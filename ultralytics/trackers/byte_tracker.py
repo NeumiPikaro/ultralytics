@@ -10,7 +10,7 @@ from ..utils import LOGGER
 from ..utils.ops import xywh2ltwh
 from .basetrack import BaseTrack, TrackState
 from .utils import matching
-from .utils.kalman_filter import KalmanFilterXYAH
+from .utils.kalman_filter import KalmanFilterXYAH, KalmanFilterLowFPS
 
 
 class STrack(BaseTrack):
@@ -263,12 +263,12 @@ class BYTETracker:
         >>> tracked_objects = tracker.update(results)
     """
 
-    def __init__(self, args, frame_rate: int = 30):
+    def __init__(self, args, frame_rate: float = 30):
         """Initialize a BYTETracker instance for object tracking.
 
         Args:
             args (Namespace): Command-line arguments containing tracking parameters.
-            frame_rate (int): Frame rate of the video sequence.
+            frame_rate (float): Frame rate of the video sequence.
         """
         self.tracked_stracks: list[STrack] = []
         self.lost_stracks: list[STrack] = []
@@ -276,7 +276,23 @@ class BYTETracker:
 
         self.frame_id = 0
         self.args = args
-        self.max_time_lost = int(frame_rate / 30.0 * args.track_buffer)
+        self.frame_rate = frame_rate
+
+        # Fix max_time_lost calculation for low FPS
+        # Original: int(frame_rate / 30.0 * args.track_buffer) gives 0 at 0.5 FPS!
+        # Use minimum of 3 frames to prevent immediate track death
+        self.max_time_lost = max(int(frame_rate / 30.0 * args.track_buffer), 3)
+
+        # Store image size for centroid distance normalization (can be updated per frame)
+        self.img_size = (1080, 1920)  # default, will be updated if available
+
+        # Low FPS mode flag
+        self.low_fps_mode = frame_rate < 5.0
+
+        # Hybrid distance weights for low FPS (can be configured)
+        self.use_hybrid_distance = frame_rate < 5.0
+        self.hybrid_weights = {'iou': 0.3, 'centroid': 0.5, 'size': 0.2}
+
         self.kalman_filter = self.get_kalmanfilter()
         self.reset_id()
 
@@ -338,7 +354,18 @@ class BYTETracker:
         # Step 3: Second association, with low score detection boxes association the untrack to the low score detections
         detections_second = self.init_track(results_second, feats_second)
         r_tracked_stracks = [strack_pool[i] for i in u_track if strack_pool[i].state == TrackState.Tracked]
-        dists = matching.iou_distance(r_tracked_stracks, detections_second)
+        # Use hybrid distance for low FPS second association
+        if self.use_hybrid_distance and len(r_tracked_stracks) > 0 and len(detections_second) > 0:
+            dists = matching.hybrid_distance(
+                r_tracked_stracks,
+                detections_second,
+                iou_weight=self.hybrid_weights['iou'],
+                centroid_weight=self.hybrid_weights['centroid'],
+                size_weight=self.hybrid_weights['size'],
+                img_size=self.img_size,
+            )
+        else:
+            dists = matching.iou_distance(r_tracked_stracks, detections_second)
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections_second)
         matches, u_track, _u_detection_second = matching.linear_assignment(dists, thresh=0.5)
@@ -387,7 +414,9 @@ class BYTETracker:
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.tracked_stracks)
         self.lost_stracks.extend(lost_stracks)
         self.lost_stracks = self.sub_stracks(self.lost_stracks, self.removed_stracks)
-        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(self.tracked_stracks, self.lost_stracks)
+        self.tracked_stracks, self.lost_stracks = self.remove_duplicate_stracks(
+            self.tracked_stracks, self.lost_stracks, use_centroid=self.low_fps_mode, img_size=self.img_size
+        )
         self.removed_stracks.extend(removed_stracks)
         if len(self.removed_stracks) > 1000:
             self.removed_stracks = self.removed_stracks[-1000:]  # clip removed stracks to 1000 maximum
@@ -395,7 +424,12 @@ class BYTETracker:
         return np.asarray([x.result for x in self.tracked_stracks if x.is_activated], dtype=np.float32)
 
     def get_kalmanfilter(self) -> KalmanFilterXYAH:
-        """Return a Kalman filter object for tracking bounding boxes using KalmanFilterXYAH."""
+        """Return a Kalman filter object for tracking bounding boxes.
+
+        For low FPS (< 5), uses KalmanFilterLowFPS with scaled process noise and velocity damping.
+        """
+        if self.low_fps_mode:
+            return KalmanFilterLowFPS(fps=self.frame_rate, reference_fps=30.0)
         return KalmanFilterXYAH()
 
     def init_track(self, results, img: np.ndarray | None = None) -> list[STrack]:
@@ -407,7 +441,22 @@ class BYTETracker:
         return [STrack(xywh, s, c) for (xywh, s, c) in zip(bboxes, results.conf, results.cls)]
 
     def get_dists(self, tracks: list[STrack], detections: list[STrack]) -> np.ndarray:
-        """Calculate the distance between tracks and detections using IoU and optionally fuse scores."""
+        """Calculate the distance between tracks and detections.
+
+        For low FPS (< 5), uses hybrid distance (centroid + IoU + size) instead of pure IoU.
+        This is critical because at low FPS, objects move too far for IoU-based matching to work.
+        """
+        if self.use_hybrid_distance and len(tracks) > 0 and len(detections) > 0:
+            return matching.hybrid_distance(
+                tracks,
+                detections,
+                iou_weight=self.hybrid_weights['iou'],
+                centroid_weight=self.hybrid_weights['centroid'],
+                size_weight=self.hybrid_weights['size'],
+                img_size=self.img_size,
+            )
+
+        # Default IoU-based distance
         dists = matching.iou_distance(tracks, detections)
         if self.args.fuse_score:
             dists = matching.fuse_score(dists, detections)
@@ -453,10 +502,24 @@ class BYTETracker:
         return [t for t in tlista if t.track_id not in track_ids_b]
 
     @staticmethod
-    def remove_duplicate_stracks(stracksa: list[STrack], stracksb: list[STrack]) -> tuple[list[STrack], list[STrack]]:
-        """Remove duplicate stracks from two lists based on Intersection over Union (IoU) distance."""
-        pdist = matching.iou_distance(stracksa, stracksb)
-        pairs = np.where(pdist < 0.15)
+    def remove_duplicate_stracks(stracksa: list[STrack], stracksb: list[STrack], use_centroid: bool = False, img_size: tuple = (1080, 1920)) -> tuple[list[STrack], list[STrack]]:
+        """Remove duplicate stracks from two lists based on IoU or centroid distance.
+
+        Args:
+            stracksa: First list of tracks.
+            stracksb: Second list of tracks.
+            use_centroid: Use centroid distance instead of IoU (for low FPS).
+            img_size: Image (height, width) for centroid normalization.
+        """
+        # Use IoU for high FPS, centroid for low FPS
+        if use_centroid:
+            pdist = matching.centroid_distance(stracksa, stracksb, img_size)
+            thresh = 0.15  # 15% of image diagonal
+        else:
+            pdist = matching.iou_distance(stracksa, stracksb)
+            thresh = 0.15
+
+        pairs = np.where(pdist < thresh)
         dupa, dupb = [], []
         for p, q in zip(*pairs):
             timep = stracksa[p].frame_id - stracksa[p].start_frame

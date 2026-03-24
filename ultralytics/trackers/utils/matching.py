@@ -152,3 +152,182 @@ def fuse_score(cost_matrix: np.ndarray, detections: list) -> np.ndarray:
     det_scores = det_scores[None].repeat(cost_matrix.shape[0], axis=0)
     fuse_sim = iou_sim * det_scores
     return 1 - fuse_sim  # fuse_cost
+
+
+def centroid_distance(atracks: list, btracks: list, img_size: tuple = (1080, 1920)) -> np.ndarray:
+    """Compute centroid (center-to-center) distance between tracks, normalized by image diagonal.
+
+    Args:
+        atracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes in xyxy/xywh format.
+        btracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes in xyxy/xywh format.
+        img_size (tuple): Image (height, width) for normalizing distance. Default (1080, 1920).
+
+    Returns:
+        (np.ndarray): Normalized distance matrix with shape (len(atracks), len(btracks)).
+    """
+    def get_centers(tracks):
+        if not tracks:
+            return np.array([])
+        if tracks and hasattr(tracks[0], 'xyxy'):
+            # STrack objects - use tlwh property
+            centers = np.array([t.tlwh[:2] + t.tlwh[2:] / 2 for t in tracks])
+        else:
+            # numpy arrays - assume xyxy format
+            centers = np.array([t[:2] + t[2:] / 2 for t in tracks])
+        return centers
+
+    a_centers = get_centers(atracks)
+    b_centers = get_centers(btracks)
+
+    if len(a_centers) == 0 or len(b_centers) == 0:
+        return np.zeros((len(atracks), len(btracks)), dtype=np.float32)
+
+    # Compute pairwise L2 distances
+    dists = np.linalg.norm(a_centers[:, None] - b_centers[None, :], axis=2)
+
+    # Normalize by image diagonal
+    diag = np.sqrt(img_size[0] ** 2 + img_size[1] ** 2)
+    return dists / diag
+
+
+def size_distance(atracks: list, btracks: list) -> np.ndarray:
+    """Compute size similarity distance (log ratio of areas).
+
+    Args:
+        atracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes.
+        btracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes.
+
+    Returns:
+        (np.ndarray): Size distance matrix with shape (len(atracks), len(btracks)).
+    """
+    def get_areas(tracks):
+        if not tracks:
+            return np.array([])
+        if tracks and hasattr(tracks[0], 'tlwh'):
+            # STrack objects
+            return np.array([t.tlwh[2] * t.tlwh[3] for t in tracks])
+        else:
+            # numpy arrays
+            return np.array([t[2] * t[3] for t in tracks])
+
+    a_areas = get_areas(atracks)
+    b_areas = get_areas(btracks)
+
+    if len(a_areas) == 0 or len(b_areas) == 0:
+        return np.zeros((len(atracks), len(btracks)), dtype=np.float32)
+
+    # Log ratio is symmetric and penalizes size differences
+    size_ratios = a_areas[:, None] / (b_areas[None, :] + 1e-6)
+    size_dist = np.abs(np.log(size_ratios))
+    return size_dist / 2.0  # normalize roughly to [0, 1]
+
+
+def diou_distance(atracks: list, btracks: list) -> np.ndarray:
+    """Compute Distance-IoU (DIoU) distance between tracks.
+
+    DIoU adds centroid distance to IoU, giving meaningful gradients even when boxes don't overlap.
+
+    Args:
+        atracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes in xyxy format.
+        btracks (list[STrack] | list[np.ndarray]): List of tracks or bounding boxes in xyxy format.
+
+    Returns:
+        (np.ndarray): DIoU distance matrix with shape (len(atracks), len(btracks)).
+    """
+    def get_boxes(tracks):
+        if not tracks:
+            return np.array([])
+        if tracks and hasattr(tracks[0], 'xyxy'):
+            return np.array([t.xyxy for t in tracks])
+        return np.array(tracks)
+
+    atlbrs = get_boxes(atracks)
+    btlbrs = get_boxes(btracks)
+
+    if len(atlbrs) == 0 or len(btlbrs) == 0:
+        return np.zeros((len(atracks), len(btracks)), dtype=np.float32)
+
+    # Compute IoU
+    ious = np.zeros((len(atlbrs), len(btlbrs)), dtype=np.float32)
+    if len(atlbrs) and len(btlbrs):
+        ious = bbox_ioa(
+            np.ascontiguousarray(atlbrs, dtype=np.float32),
+            np.ascontiguousarray(btlbrs, dtype=np.float32),
+            iou=True,
+        )
+
+    # Compute centroid distance for enclosing box penalty
+    a_centers = (atlbrs[:, :2] + atlbrs[:, 2:]) / 2  # (N, 2)
+    b_centers = (btlbrs[:, :2] + btlbrs[:, 2:]) / 2  # (M, 2)
+
+    # Enclosing box
+    tl = np.minimum(atlbrs[:, None, :2], btlbrs[None, :, :2])
+    br = np.maximum(atlbrs[:, None, 2:], btlbrs[None, :, 2:])
+    enclose_wh = br - tl
+    enclose_diagonal = np.sqrt(enclose_wh[:, :, 0] ** 2 + enclose_wh[:, :, 1] ** 2) + 1e-6
+
+    # Centroid distance
+    center_dists = np.sqrt(np.sum((a_centers[:, None] - b_centers[None, :]) ** 2, axis=2))
+
+    # DIoU = IoU - (center_dist^2 / enclose_diagonal^2)
+    diou = ious - (center_dists ** 2) / (enclose_diagonal ** 2)
+
+    # Convert to distance (1 - DIoU), clamped to [0, 1]
+    return np.clip(1 - diou, 0, 1)
+
+
+def hybrid_distance(
+    atracks: list,
+    btracks: list,
+    iou_weight: float = 0.3,
+    centroid_weight: float = 0.5,
+    size_weight: float = 0.2,
+    img_size: tuple = (1080, 1920),
+    use_iou: bool = True,
+    use_centroid: bool = True,
+    use_size: bool = True,
+) -> np.ndarray:
+    """Compute hybrid distance combining IoU, centroid, and size distances.
+
+    This is critical for low FPS tracking where IoU alone fails due to large object displacement.
+
+    Args:
+        atracks (list[STrack]): List of tracks.
+        btracks (list[STrack]): List of detections.
+        iou_weight (float): Weight for IoU distance.
+        centroid_weight (float): Weight for centroid distance.
+        size_weight (float): Weight for size distance.
+        img_size (tuple): Image (height, width) for centroid normalization.
+        use_iou (bool): Include IoU in hybrid distance.
+        use_centroid (bool): Include centroid distance.
+        use_size (bool): Include size distance.
+
+    Returns:
+        (np.ndarray): Hybrid distance matrix with shape (len(atracks), len(btracks)).
+    """
+    if len(atracks) == 0 or len(btracks) == 0:
+        return np.zeros((len(atracks), len(btracks)), dtype=np.float32)
+
+    total_weight = 0.0
+    dists = np.zeros((len(atracks), len(btracks)), dtype=np.float32)
+
+    if use_iou:
+        iou_dists = iou_distance(atracks, btracks)
+        dists += iou_weight * iou_dists
+        total_weight += iou_weight
+
+    if use_centroid:
+        center_dists = centroid_distance(atracks, btracks, img_size)
+        dists += centroid_weight * center_dists
+        total_weight += centroid_weight
+
+    if use_size:
+        size_dists = size_distance(atracks, btracks)
+        dists += size_weight * size_dists
+        total_weight += size_weight
+
+    # Normalize by total weight
+    if total_weight > 0:
+        dists /= total_weight
+
+    return dists

@@ -478,3 +478,258 @@ class KalmanFilterXYWH(KalmanFilterXYAH):
             >>> new_mean, new_covariance = kf.update(mean, covariance, measurement)
         """
         return super().update(mean, covariance, measurement)
+
+
+class KalmanFilterLowFPS(KalmanFilterXYAH):
+    """Kalman filter adapted for low frame rates (0.5-5 FPS).
+
+    At low FPS, objects move large distances between frames (180-300+ pixels), which breaks
+    assumptions designed for 30 FPS tracking. This filter addresses:
+
+    1. Time-scaled dt: Motion matrix uses actual time delta between frames
+    2. Increased process noise: Accounts for larger uncertainty over longer intervals
+    3. Velocity damping: Reduces reliance on constant velocity assumption over long gaps
+    4. Larger initial velocity covariance: Unknown velocity at track initialization
+
+    Usage:
+        >>> kf = KalmanFilterLowFPS(fps=0.5, reference_fps=30.0)
+    """
+
+    def __init__(self, fps: float = 30.0, reference_fps: float = 30.0):
+        """Initialize LowFPS Kalman filter.
+
+        Args:
+            fps (float): Actual frame rate of the video. Default 30.0.
+            reference_fps (float): Reference frame rate for tuning. Default 30.0.
+        """
+        # Call parent's __init__ first but we'll override the matrices
+        ndim = 4
+
+        # Time delta ratio (how much slower than reference)
+        self.dt_ratio = reference_fps / fps if fps > 0 else 1.0
+        self.fps = fps
+        self.reference_fps = reference_fps
+
+        # Create Kalman filter model matrices with scaled dt
+        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
+        for i in range(ndim):
+            self._motion_mat[i, ndim + i] = self.dt_ratio  # Use scaled dt
+        self._update_mat = np.eye(ndim, 2 * ndim)
+
+        # Scale process noise for low FPS
+        # At 0.5 FPS vs 30 FPS, uncertainty grows ~60x more between frames
+        scale_factor = np.sqrt(self.dt_ratio)
+        self._std_weight_position = (1.0 / 20) * scale_factor
+        self._std_weight_velocity = (1.0 / 160) * scale_factor
+
+        # Velocity damping factor - reduces confidence in velocity over long gaps
+        # At low FPS, constant velocity is a worse assumption
+        self.velocity_decay = np.exp(-self.dt_ratio / 30.0) if self.dt_ratio > 1 else 1.0
+
+    def initiate(self, measurement: np.ndarray):
+        """Create a track from an unassociated measurement with increased velocity uncertainty.
+
+        Args:
+            measurement (np.ndarray): Bounding box coordinates (x, y, a, h).
+
+        Returns:
+            mean (np.ndarray): Mean vector (8-dimensional) of the new track.
+            covariance (np.ndarray): Covariance matrix (8x8) of the new track.
+        """
+        mean_pos = measurement
+        mean_vel = np.zeros_like(mean_pos)
+        mean = np.r_[mean_pos, mean_vel]
+
+        # Increase velocity uncertainty at init for low FPS
+        vel_scale = 10 * self.dt_ratio  # Scale velocity uncertainty by dt ratio
+
+        std = [
+            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_position * measurement[3],
+            1e-2,
+            2 * self._std_weight_position * measurement[3],
+            vel_scale * self._std_weight_velocity * measurement[3],
+            vel_scale * self._std_weight_velocity * measurement[3],
+            1e-5,
+            vel_scale * self._std_weight_velocity * measurement[3],
+        ]
+        covariance = np.diag(np.square(std))
+        return mean, covariance
+
+    def predict(self, mean: np.ndarray, covariance: np.ndarray):
+        """Run Kalman filter prediction with velocity damping for low FPS.
+
+        Args:
+            mean (np.ndarray): The 8-dimensional mean vector of the object state.
+            covariance (np.ndarray): The 8x8-dimensional covariance matrix.
+
+        Returns:
+            mean (np.ndarray): Mean vector of the predicted state.
+            covariance (np.ndarray): Covariance matrix of the predicted state.
+        """
+        std_pos = [
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[3],
+            1e-2,
+            self._std_weight_position * mean[3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[3],
+            self._std_weight_velocity * mean[3],
+            1e-5,
+            self._std_weight_velocity * mean[3],
+        ]
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+
+        # Standard Kalman predict
+        mean = np.dot(mean, self._motion_mat.T)
+        covariance = np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+
+        # Apply velocity damping for low FPS (reduce velocity confidence over long gaps)
+        if self.velocity_decay < 1.0:
+            # Reduce velocity components in covariance
+            covariance[4:, 4:] *= self.velocity_decay
+
+        return mean, covariance
+
+    def multi_predict(self, mean: np.ndarray, covariance: np.ndarray):
+        """Run Kalman filter prediction for multiple states with velocity damping.
+
+        Args:
+            mean (np.ndarray): The Nx8 dimensional mean matrix.
+            covariance (np.ndarray): The Nx8x8 covariance matrix.
+
+        Returns:
+            mean (np.ndarray): Mean matrix of predicted states.
+            covariance (np.ndarray): Covariance matrix of predicted states.
+        """
+        std_pos = [
+            self._std_weight_position * mean[:, 3],
+            self._std_weight_position * mean[:, 3],
+            1e-2 * np.ones_like(mean[:, 3]),
+            self._std_weight_position * mean[:, 3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[:, 3],
+            self._std_weight_velocity * mean[:, 3],
+            1e-5 * np.ones_like(mean[:, 3]),
+            self._std_weight_velocity * mean[:, 3],
+        ]
+        sqr = np.square(np.r_[std_pos, std_vel]).T
+
+        motion_cov = [np.diag(sqr[i]) for i in range(len(mean))]
+        motion_cov = np.asarray(motion_cov)
+
+        mean = np.dot(mean, self._motion_mat.T)
+        left = np.dot(self._motion_mat, covariance).transpose((1, 0, 2))
+        covariance = np.dot(left, self._motion_mat.T) + motion_cov
+
+        # Apply velocity damping
+        if self.velocity_decay < 1.0:
+            covariance[:, 4:, 4:] *= self.velocity_decay
+
+        return mean, covariance
+
+
+class KalmanFilterLowFPSXYWH(KalmanFilterXYWH):
+    """LowFPS Kalman filter with XYWH (width/height) representation instead of XYAH.
+
+    This variant uses independent width and height instead of aspect ratio, which is more
+    robust to pose changes (e.g., person sitting down) that occur over long frame intervals.
+    """
+
+    def __init__(self, fps: float = 30.0, reference_fps: float = 30.0):
+        """Initialize LowFPS XYWH Kalman filter.
+
+        Args:
+            fps (float): Actual frame rate. Default 30.0.
+            reference_fps (float): Reference frame rate. Default 30.0.
+        """
+        ndim = 4
+        self.dt_ratio = reference_fps / fps if fps > 0 else 1.0
+        self.fps = fps
+        self.reference_fps = reference_fps
+
+        self._motion_mat = np.eye(2 * ndim, 2 * ndim)
+        for i in range(ndim):
+            self._motion_mat[i, ndim + i] = self.dt_ratio
+        self._update_mat = np.eye(ndim, 2 * ndim)
+
+        scale_factor = np.sqrt(self.dt_ratio)
+        self._std_weight_position = (1.0 / 20) * scale_factor
+        self._std_weight_velocity = (1.0 / 160) * scale_factor
+
+        self.velocity_decay = np.exp(-self.dt_ratio / 30.0) if self.dt_ratio > 1 else 1.0
+
+    def initiate(self, measurement: np.ndarray):
+        """Create track with increased velocity uncertainty for low FPS."""
+        mean_pos = measurement
+        mean_vel = np.zeros_like(mean_pos)
+        mean = np.r_[mean_pos, mean_vel]
+
+        vel_scale = 10 * self.dt_ratio
+
+        std = [
+            2 * self._std_weight_position * measurement[2],
+            2 * self._std_weight_position * measurement[3],
+            2 * self._std_weight_position * measurement[2],
+            2 * self._std_weight_position * measurement[3],
+            vel_scale * self._std_weight_velocity * measurement[2],
+            vel_scale * self._std_weight_velocity * measurement[3],
+            vel_scale * self._std_weight_velocity * measurement[2],
+            vel_scale * self._std_weight_velocity * measurement[3],
+        ]
+        covariance = np.diag(np.square(std))
+        return mean, covariance
+
+    def predict(self, mean: np.ndarray, covariance: np.ndarray):
+        """Predict with velocity damping."""
+        std_pos = [
+            self._std_weight_position * mean[2],
+            self._std_weight_position * mean[3],
+            self._std_weight_position * mean[2],
+            self._std_weight_position * mean[3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[2],
+            self._std_weight_velocity * mean[3],
+            self._std_weight_velocity * mean[2],
+            self._std_weight_velocity * mean[3],
+        ]
+        motion_cov = np.diag(np.square(np.r_[std_pos, std_vel]))
+
+        mean = np.dot(mean, self._motion_mat.T)
+        covariance = np.linalg.multi_dot((self._motion_mat, covariance, self._motion_mat.T)) + motion_cov
+
+        if self.velocity_decay < 1.0:
+            covariance[4:, 4:] *= self.velocity_decay
+
+        return mean, covariance
+
+    def multi_predict(self, mean: np.ndarray, covariance: np.ndarray):
+        """Multi-predict with velocity damping."""
+        std_pos = [
+            self._std_weight_position * mean[:, 2],
+            self._std_weight_position * mean[:, 3],
+            self._std_weight_position * mean[:, 2],
+            self._std_weight_position * mean[:, 3],
+        ]
+        std_vel = [
+            self._std_weight_velocity * mean[:, 2],
+            self._std_weight_velocity * mean[:, 3],
+            self._std_weight_velocity * mean[:, 2],
+            self._std_weight_velocity * mean[:, 3],
+        ]
+        sqr = np.square(np.r_[std_pos, std_vel]).T
+
+        motion_cov = [np.diag(sqr[i]) for i in range(len(mean))]
+        motion_cov = np.asarray(motion_cov)
+
+        mean = np.dot(mean, self._motion_mat.T)
+        left = np.dot(self._motion_mat, covariance).transpose((1, 0, 2))
+        covariance = np.dot(left, self._motion_mat.T) + motion_cov
+
+        if self.velocity_decay < 1.0:
+            covariance[:, 4:, 4:] *= self.velocity_decay
+
+        return mean, covariance
